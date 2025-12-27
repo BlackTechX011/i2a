@@ -4,11 +4,13 @@ use futures_util::TryStreamExt;
 use reqwest::Client;
 use std::io::{self, Write};
 use std::net::TcpStream;
-use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 use warp::Filter;
-
+use emissary_cli::cli::{
+    Arguments, HttpProxyOptions, MetricsOptions, PortForwardingOptions, ReseedOptions,
+    RouterUiOptions, SocksProxyOptions, TransitOptions, TunnelOptions,
+};
 
 // --- CLI ARGUMENTS STRUCT ---
 #[derive(Parser, Debug)]
@@ -28,10 +30,6 @@ struct Args {
     /// The upstream I2P HTTP Proxy port (Emissary default: 4444)
     #[arg(long, default_value_t = 4444)]
     upstream: u16,
-
-    /// Path to the I2P binary (Emissary)
-    #[arg(long, default_value = "emissary-cli.exe")]
-    bin: String,
 }
 
 #[tokio::main]
@@ -55,8 +53,8 @@ async fn main() {
         args.port.to_string().cyan()
     );
 
-    // 3. Launch/Check Emissary
-    check_or_launch_router(&args.bin);
+    // 3. Launch Emissary (Embedded)
+    launch_embedded_router(args.upstream);
 
     // 4. Wait for Upstream Proxy
     if !wait_for_upstream(args.upstream) {
@@ -111,29 +109,80 @@ fn print_banner() {
     println!("  --------------------------\n");
 }
 
-fn check_or_launch_router(bin_name: &str) {
-    print!("{} Checking for I2P Router process...", "[INIT]".bold().blue());
+fn launch_embedded_router(port: u16) {
+    print!("{} Starting embedded I2P Router...", "[INIT]".bold().blue());
     io::stdout().flush().unwrap();
 
-    // Attempt to spawn. If it fails, we assume it's missing or running.
-    match Command::new(bin_name)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(_) => println!(" {}", "Started internal router.".green()),
-        Err(_) => println!(
-            " {}",
-            "Not found (Assuming external router is running).".yellow()
-        ),
-    }
+    // Construct Emissary Arguments manually
+    let emissary_args = Arguments {
+        base_path: None,
+        log: None, // Use default logging
+        floodfill: None,
+        allow_local: None,
+        caps: None,
+        net_id: None,
+        overwrite_config: None,
+        tunnel: TunnelOptions {
+            exploratory_inbound_len: None,
+            exploratory_inbound_count: None,
+            exploratory_outbound_len: None,
+            exploratory_outbound_count: None,
+            insecure_tunnels: None,
+        },
+        reseed: ReseedOptions {
+            reseed_hosts: None,
+            disable_reseed: None,
+            reseed_threshold: None,
+            force_reseed: None,
+            disable_force_ipv4: None,
+        },
+        metrics: MetricsOptions {
+            metrics_server_port: None,
+            disable_metrics: None,
+        },
+        http_proxy: HttpProxyOptions {
+            http_proxy_port: Some(port),
+            http_proxy_host: None,
+            http_outproxy: None,
+        },
+        socks_proxy: SocksProxyOptions {
+            socks_proxy_port: None,
+            socks_proxy_host: None,
+        },
+        transit: TransitOptions {
+            max_transit_tunnels: None,
+            disable_transit_tunnels: None,
+        },
+        port_forwarding: PortForwardingOptions {
+            disable_upnp: None,
+            disable_nat_pmp: None,
+            upnp_name: None,
+        },
+        router_ui: RouterUiOptions {
+            disable_ui: Some(true), // Disable UI by default for embedded usage to save resources
+            refresh_interval: None,
+            theme: None,
+            web_ui_port: None,
+        },
+        command: None,
+    };
+
+    // Spawn Emissary in a separate task
+    tokio::spawn(async move {
+        if let Err(e) = emissary_cli::run(emissary_args).await {
+            eprintln!("Emissary Router Error: {:?}", e);
+        }
+    });
+
+    println!(" {}", "Background process started.".green());
 }
 
 fn wait_for_upstream(port: u16) -> bool {
     print!("{} Connecting to upstream (Port {})...", "[NET]".bold().blue(), port);
     io::stdout().flush().unwrap();
 
-    for _ in 0..15 {
+    // Increased timeout for router startup
+    for _ in 0..60 {
         if TcpStream::connect(format!("127.0.0.1:{}", port)).is_ok() {
             println!(" {}", "Connected.".green());
             return true;
