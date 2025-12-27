@@ -1,11 +1,10 @@
-name: Auto Release (Debounced)
+name: Auto Release (Multi-Platform)
 
 on:
   push:
     branches: [ "main" ]
 
-# This checks if a build is already running for 'main'. 
-# If a new commit comes in, it kills the old one and starts over.
+# Cancel previous runs if a new commit is pushed within the debounce window
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -14,72 +13,113 @@ permissions:
   contents: write
 
 jobs:
-  build-and-release:
-    name: Build Windows EXE
-    runs-on: windows-latest
-    
+  # 1. Debounce Job
+  stabilize:
+    name: ⏳ Stabilize
+    runs-on: ubuntu-latest
     steps:
-    # 1. The "Wait" Logic (Debounce)
-    # We wait 2 minutes. If a new commit is pushed during this time, 
-    # the 'concurrency' setting above kills this job and starts a new one.
-    - name: ⏳ Wait for stability (2m)
-      run: Start-Sleep -Seconds 120
-      shell: powershell
+      - name: Wait for stability (2m)
+        run: sleep 120
 
-    # 2. Checkout Code
-    - name: 📥 Checkout code
-      uses: actions/checkout@v4
+  # 2. Build Matrix
+  build:
+    name: Build ${{ matrix.os }}
+    needs: stabilize
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary_name: i2a
+            asset_name: i2a-linux-amd64.tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary_name: i2a.exe
+            asset_name: i2a-windows-amd64.zip
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            binary_name: i2a
+            asset_name: i2a-macos-amd64.tar.gz
+          - os: macos-14
+            target: aarch64-apple-darwin
+            binary_name: i2a
+            asset_name: i2a-macos-arm64.tar.gz
 
-    # 3. Setup Rust
-    - name: 🦀 Setup Rust
-      uses: dtolnay/rust-toolchain@stable
-      with:
-        toolchain: stable
-        target: x86_64-pc-windows-msvc
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
 
-    # 4. Build the EXE
-    - name: 🔨 Build Release
-      run: |
-        cd i2a
-        cargo build --release --verbose
+      - name: 🦀 Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
 
-    # 5. Create a Version Tag
-    # Generates a version like v1.0.45 based on the run number
-    - name: 🏷️ Generate Version Tag
-      id: tag_version
-      run: |
-        echo "VERSION=v1.0.${{ github.run_number }}" >> $env:GITHUB_ENV
-        echo "Detected Version: v1.0.${{ github.run_number }}"
-      shell: powershell
+      - name: 🐧 Install Linux Dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config
 
-    # 6. Package the zip
-    # We zip the EXE and the README
-    - name: 📦 Create Zip Package
-      run: |
-        mkdir release
-        copy i2a/target/release/i2a.exe release/
-        copy README.md release/
-        Compress-Archive -Path release/* -DestinationPath i2a_windows_x64.zip
-      shell: powershell
+      - name: 🔨 Build
+        run: cargo build --release --verbose --manifest-path i2a/Cargo.toml --target ${{ matrix.target }}
 
-    # 7. Create GitHub Release
-    - name: 🚀 Publish Release
-      uses: softprops/action-gh-release@v1
-      with:
-        tag_name: ${{ env.VERSION }}
-        name: Release ${{ env.VERSION }}
-        body: |
-          ### 🚀 Auto-Build ${{ env.VERSION }}
+      - name: 📦 Package
+        shell: bash
+        run: |
+          mkdir staging
+          # Copy binary
+          cp i2a/target/${{ matrix.target }}/release/${{ matrix.binary_name }} staging/
+          # Copy Readme if exists
+          cp Readme.md staging/ || true
           
-          **Changes in this build:**
-          ${{ github.event.head_commit.message }}
-          
-          ---
-          *Automated release by i2a CI*
-        files: |
-          i2a_windows_x64.zip
-        draft: false
-        prerelease: false
-      env:
+          cd staging
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a ../${{ matrix.asset_name }} *
+          else
+            tar -czvf ../${{ matrix.asset_name }} *
+          fi
 
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: ⬆️ Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.asset_name }}
+          if-no-files-found: error
+
+  # 3. Publish Release
+  release:
+    name: 🚀 Publish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: ⬇️ Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: 🏷️ Generate Version
+        id: version
+        run: echo "VERSION=v1.0.${{ github.run_number }}" >> $GITHUB_ENV
+
+      - name: 🚀 Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ env.VERSION }}
+          name: Release ${{ env.VERSION }}
+          body: |
+            ### 🚀 Auto-Build ${{ env.VERSION }}
+            
+            **Changes in this build:**
+            ${{ github.event.head_commit.message }}
+            
+            ---
+            *Automated multi-platform release by i2a CI*
+          files: assets/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
